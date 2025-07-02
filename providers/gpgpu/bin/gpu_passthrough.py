@@ -23,12 +23,14 @@ import argparse
 import logging
 import os
 import time
+import math
+import psutil
 
 from checkbox_support.lxd_support import LXD, LXDVM
 
 GPU_VENDORS = {
     "nvidia": {
-        "test": "mixbench.cuda",
+        "test": "sudo mixbench.cuda",
         "lxd": {
             "launch_options": [
                 "-c",
@@ -63,6 +65,14 @@ GPU_THRESHOLD_SEC = 12.0
 This can be overwritten by the `--threshold` option or by setting the
 environment variable `LXD_GPU_THRESHOLD`. With priority in that order.
 """
+
+QEMU_OPTS = ""
+"""Any custom QEMU options required for passthrough on your platform
+
+This can be overwritten by the `--qemuopts` option or by setting the
+environment variable `QEMU_OPTS`. With priority in that order.
+"""
+
 
 
 def run_gpu_test(
@@ -134,6 +144,29 @@ def test_lxdvm_gpu(args):
         logging.info("Waiting for %s to be up", instance.name)
         instance.wait_until_running()
 
+        instance.stop(force=True)
+
+        if QEMU_OPTS:
+            logging.info("Setting user-provided QEMU options: %s", QEMU_OPTS)
+            instance.set_config("raw.qemu='{}'".format(QEMU_OPTS))
+
+        # Passing highest power of 2 lower than sqrt(nproc) as number of VM CPUs
+        # Formula: int(2^int(log_2(sqrt(total host memory))))
+        vm_cpu_limit = int(pow(2, int(math.log(math.sqrt(psutil.cpu_count()), 2))))
+        logging.info("Setting a higher CPU limit for the VM: %s CPUs", str(vm_cpu_limit))
+        instance.set_config("limits.cpu "+ str(vm_cpu_limit))
+
+        # Passing highest power of 2 lower than (total memory/2) as VM memory limit
+        # Formula: int(2^int(log_2(sqrt(total host memory))))
+        vm_mem_limit = int(pow(2, int(math.log((psutil.virtual_memory().total / 2), 2))))
+        vm_mem_limit_mb = vm_mem_limit / 1024 / 1024
+        logging.info("Setting a higher memory limit for the VM: %s bytes", str(vm_mem_limit))
+        instance.set_config("limits.memory " + str(int(vm_mem_limit_mb)) + "MB")
+
+        instance.start()
+
+        instance.wait_until_running()
+
         logging.info("Passing GPU %s through to %s", args.pci, instance.name)
         instance.add_device("gpu", "gpu", options=["pci={}".format(args.pci)])
 
@@ -159,6 +192,19 @@ def test_lxdvm_gpu(args):
             args.count,
             args.threshold,
         )
+
+def get_physical_address_bits():
+    # Run `lscpu -J` and capture the output
+    result = subprocess.run(['lscpu', '-J'], capture_output=True, text=True, check=True)
+    lscpu_json = json.loads(result.stdout)
+
+    # Parse the JSON to find "Address sizes"
+    for entry in lscpu_json.get('lscpu', []):
+        if entry['field'] == 'Address sizes:':
+            match = re.search(r'(\d+)\s+bits physical', entry['data'])
+            if match:
+                return int(match.group(1))
+    return None
 
 
 def parse_args():
@@ -190,6 +236,8 @@ def parse_args():
         help="Times to run GPU test",
     )
 
+
+
     gpu_group = parser.add_argument_group("gpu")
     gpu_group.add_argument(
         "--pci", type=str, help="PCI address of GPU", required=True
@@ -200,6 +248,13 @@ def parse_args():
         choices=GPU_VENDORS.keys(),
         help="GPU vendor",
         required=True,
+    )
+
+    gpu_group.add_argument(
+        "--qemuopts",
+        type=str,
+        default=str(os.getenv("QEMU_OPTS") or QEMU_OPTS),
+        help="Custom QEMU Options required for your platform",
     )
 
     lxd_subparser = subparsers.add_parser("lxd", help="Run on LXD container")
